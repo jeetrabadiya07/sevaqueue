@@ -1,0 +1,212 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOfficer() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/officers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/officers/$(request.auth.uid)).data.active != false;
+    }
+
+    function validPriority(value) {
+      return value in ['regular', 'standard', 'senior', 'divyang', 'disability', 'pregnant'];
+    }
+
+    function validChannel(value) {
+      return value in ['sms', 'whatsapp'];
+    }
+
+    function validLanguage(value) {
+      return value in ['en', 'hi', 'gu'];
+    }
+
+    function validPhone(value) {
+      return value == '' || value.matches('^\\+91[6-9][0-9]{9}$');
+    }
+
+    function defaultOffice(office) {
+      return request.resource.data.id == office
+        && ((office == 'passport'
+          && request.resource.data.pre == 'P'
+          && request.resource.data.counters == 6
+          && request.resource.data.open == 6
+          && request.resource.data.avg == 14)
+        || (office == 'rto'
+          && request.resource.data.pre == 'R'
+          && request.resource.data.counters == 4
+          && request.resource.data.open == 4
+          && request.resource.data.avg == 9)
+        || (office == 'muni'
+          && request.resource.data.pre == 'M'
+          && request.resource.data.counters == 5
+          && request.resource.data.open == 5
+          && request.resource.data.avg == 11)
+        || (office == 'aadhaar'
+          && request.resource.data.pre == 'A'
+          && request.resource.data.counters == 3
+          && request.resource.data.open == 3
+          && request.resource.data.avg == 7));
+    }
+
+    function tokenAfter(tokenId) {
+      return getAfter(/databases/$(database)/documents/tokens/$(tokenId)).data;
+    }
+
+    function activeTokenPath(uid, office) {
+      return /databases/$(database)/documents/activeTokens/$(uid + '_' + office);
+    }
+
+    function citizenQueueMutation(office) {
+      let tokenId = request.resource.data.lastMutationToken;
+      let afterToken = tokenAfter(tokenId);
+      return signedIn()
+        && !isOfficer()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['waiting', 'sequence', 'lastMutationToken', 'updatedAt'])
+        && afterToken.office == office
+        && afterToken.userId == request.auth.uid
+        && ((afterToken.status == 'waiting'
+              && afterToken.sequenceNo == resource.data.sequence + 1
+              && request.resource.data.sequence == resource.data.sequence + 1
+              && request.resource.data.waiting == resource.data.waiting + 1)
+            || (resource.data.sequence == request.resource.data.sequence
+              && request.resource.data.waiting == resource.data.waiting - 1
+              && get(/databases/$(database)/documents/tokens/$(tokenId)).data.status == 'waiting'
+              && afterToken.status == 'cancelled'));
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'name', 'phone', 'language', 'priority', 'channel', 'createdAt', 'isGuest'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 40
+        && request.resource.data.phone is string
+        && validPhone(request.resource.data.phone)
+        && request.resource.data.isGuest is bool
+        && validLanguage(request.resource.data.language)
+        && validPriority(request.resource.data.priority)
+        && validChannel(request.resource.data.channel);
+    }
+
+    match /officers/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+
+    match /outbox/{messageId} {
+      allow read: if isOfficer();
+      allow write: if false;
+    }
+
+    match /activeTokens/{markerId} {
+      allow get: if isOfficer()
+        || (signedIn()
+          && (markerId == request.auth.uid + '_passport'
+            || markerId == request.auth.uid + '_rto'
+            || markerId == request.auth.uid + '_muni'
+            || markerId == request.auth.uid + '_aadhaar'));
+      allow list: if isOfficer();
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['userId', 'office', 'tokenId'])
+        && request.resource.data.userId == request.auth.uid
+        && markerId == request.auth.uid + '_' + request.resource.data.office
+        && request.resource.data.office in ['passport', 'rto', 'muni', 'aadhaar']
+        && existsAfter(/databases/$(database)/documents/tokens/$(request.resource.data.tokenId))
+        && getAfter(/databases/$(database)/documents/tokens/$(request.resource.data.tokenId)).data.userId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/tokens/$(request.resource.data.tokenId)).data.office == request.resource.data.office
+        && getAfter(/databases/$(database)/documents/tokens/$(request.resource.data.tokenId)).data.status == 'waiting';
+      allow delete: if (signedIn()
+          && resource.data.userId == request.auth.uid
+          && getAfter(/databases/$(database)/documents/tokens/$(resource.data.tokenId)).data.status == 'cancelled')
+        || (isOfficer()
+          && (!existsAfter(/databases/$(database)/documents/tokens/$(resource.data.tokenId))
+            || getAfter(/databases/$(database)/documents/tokens/$(resource.data.tokenId)).data.status in ['done', 'noshow', 'cancelled']));
+      allow update: if false;
+    }
+
+    match /officeStats/{office} {
+      allow read: if true;
+      allow create: if defaultOffice(office)
+        && request.resource.data.keys().hasOnly([
+          'id', 'pre', 'counters', 'open', 'avg', 'waiting', 'sequence', 'updatedAt'
+        ])
+        && request.resource.data.waiting == 0
+        && request.resource.data.sequence == 0;
+      allow update: if isOfficer() || citizenQueueMutation(office);
+      allow delete: if isOfficer();
+    }
+
+    match /tokens/{tokenId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          'userId', 'no', 'office', 'service', 'name', 'phone', 'phoneMasked', 'travel',
+          'channel', 'lang', 'priority', 'status', 'isGuest', 'at', 'createdAt',
+          'aheadAtBooking', 'etaAtBooking', 'rating', 'sequenceNo'
+        ])
+        && request.resource.data.office in ['passport', 'rto', 'muni', 'aadhaar']
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 40
+        && request.resource.data.phone is string
+        && validPhone(request.resource.data.phone)
+        && request.resource.data.phoneMasked is string
+        && validChannel(request.resource.data.channel)
+        && validLanguage(request.resource.data.lang)
+        && validPriority(request.resource.data.priority)
+        && request.resource.data.status == 'waiting'
+        && request.resource.data.rating == null
+        && request.resource.data.isGuest is bool
+        && request.resource.data.travel is int
+        && request.resource.data.travel >= 5
+        && request.resource.data.travel <= 90
+        && request.resource.data.sequenceNo is int
+        && ((request.resource.data.userId == request.auth.uid
+              && request.resource.data.isGuest == (request.auth.token.firebase.sign_in_provider == 'anonymous'))
+            || (isOfficer() && request.resource.data.isGuest == true))
+        && ((request.resource.data.userId == request.auth.uid
+              && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+              && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.name == request.resource.data.name
+              && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.phone == request.resource.data.phone
+              && existsAfter(activeTokenPath(request.auth.uid, request.resource.data.office))
+              && getAfter(activeTokenPath(request.auth.uid, request.resource.data.office)).data.tokenId == tokenId)
+            || (isOfficer() && request.resource.data.isGuest == true))
+        && getAfter(/databases/$(database)/documents/officeStats/$(request.resource.data.office)).data.lastMutationToken == tokenId
+        && getAfter(/databases/$(database)/documents/officeStats/$(request.resource.data.office)).data.waiting
+          == get(/databases/$(database)/documents/officeStats/$(request.resource.data.office)).data.waiting + 1
+        && getAfter(/databases/$(database)/documents/officeStats/$(request.resource.data.office)).data.sequence
+          == request.resource.data.sequenceNo
+        && request.resource.data.sequenceNo
+          == get(/databases/$(database)/documents/officeStats/$(request.resource.data.office)).data.sequence + 1;
+      allow get, list: if isOfficer() || (signedIn() && resource.data.userId == request.auth.uid);
+      allow update: if isOfficer()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'counter', 'calledAt', 'finishedAt', 'cancelledAt',
+            'waitedMinutes', 'aheadAtBooking', 'etaAtBooking'
+          ])
+          && (request.resource.data.status in ['waiting', 'serving']
+            || !existsAfter(activeTokenPath(resource.data.userId, resource.data.office)))
+        || (signedIn()
+          && resource.data.userId == request.auth.uid
+          && resource.data.status == 'waiting'
+          && request.resource.data.status == 'cancelled'
+          && !existsAfter(activeTokenPath(resource.data.userId, resource.data.office))
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'cancelledAt']))
+        || (signedIn()
+          && resource.data.userId == request.auth.uid
+          && resource.data.status == 'done'
+          && resource.data.rating == null
+          && request.resource.data.rating is int
+          && request.resource.data.rating >= 1
+          && request.resource.data.rating <= 5
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['rating', 'feedbackAt']));
+      allow delete: if isOfficer();
+    }
+  }
+}

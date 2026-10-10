@@ -1,0 +1,7 @@
+data.json
+.env
+.env.*
+!.env.example
+.firebase/
+functions/.env.*
+node_modules/
